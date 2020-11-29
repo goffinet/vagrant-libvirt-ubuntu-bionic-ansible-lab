@@ -1,0 +1,145 @@
+#!/bin/bash
+#https://github.com/rgl/xfce-desktop-vagrant/blob/master/provision-virtualization-tools.sh
+# abort this script on errors.
+#set -eux
+
+source /etc/os-release
+if [ $ID == "ubuntu" ] && [ $VERSION_ID == "18.04" ] && [ $(id -u) -eq 0 ] ; then echo requirements matched ; else exit ; fi
+
+# Added
+groupadd vagrant
+useradd -m -d /home/vagrant -g vagrant -s /bin/bash vagrant
+echo "vagrant     ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# prevent apt-get et al from opening stdin.
+# NB even with this, you'll still get some warnings that you can ignore:
+#     dpkg-preconfigure: unable to re-open stdin: No such file or directory
+export DEBIAN_FRONTEND=noninteractive
+
+# Added
+apt-get update && apt-get -y upgrade
+apt-get -y install qemu-kvm libvirt-dev virtinst virt-viewer libguestfs-tools virt-manager uuid-runtime curl linux-source libosinfo-bin genisoimage qemu-kvm libvirt-bin
+
+# install iso creation tool.
+# NB xorriso is compatible with genisoimage and mkisofs and is also available in msys2 (windows).
+apt-get install -y xorriso
+
+# install the iso-info tool.
+# NB iso-info is also available in msys2 (windows) as provided by the mingw-w64-x86_64-libcdio package.
+apt-get install -y libcdio-utils
+
+# install qemu tools.
+apt-get install -y qemu-utils
+
+# install jq.
+apt-get install -y jq
+
+# install unzip.
+apt-get install -y unzip
+
+# install libvirt et al.
+apt-get install -y virt-manager
+# configure the security_driver to prevent errors alike (when using terraform):
+#   Could not open '/var/lib/libvirt/images/terraform_example_root.img': Permission denied'
+sed -i -E 's,#?(security_driver)\s*=.*,\1 = "none",g' /etc/libvirt/qemu.conf
+systemctl restart libvirtd
+# let the vagrant user manage libvirtd.
+# see /usr/share/polkit-1/rules.d/60-libvirt.rules
+usermod -aG libvirt vagrant
+
+# install terraform.
+terraform_version=0.12.24
+terraform_url="https://releases.hashicorp.com/terraform/$terraform_version/terraform_${terraform_version}_linux_amd64.zip"
+terraform_filename="$(basename $terraform_url)"
+wget -q $terraform_url
+unzip $terraform_filename
+install terraform /usr/local/bin
+rm terraform $terraform_filename
+# install the libvirt provider.
+terraform_libvirt_provider_url='https://github.com/dmacvicar/terraform-provider-libvirt/releases/download/v0.6.2/terraform-provider-libvirt-0.6.2+git.1585292411.8cbe9ad0.Ubuntu_18.04.amd64.tar.gz'
+terraform_libvirt_provider_filename="/tmp/$(basename $terraform_libvirt_provider_url)"
+wget -qO $terraform_libvirt_provider_filename $terraform_libvirt_provider_url
+su vagrant -c bash <<VAGRANT_EOF
+#!/bin/bash
+set -euxo pipefail
+cd ~
+tar xf $terraform_libvirt_provider_filename
+install -d ~/.terraform.d/plugins/linux_amd64
+install terraform-provider-libvirt ~/.terraform.d/plugins/linux_amd64/
+rm terraform-provider-libvirt
+VAGRANT_EOF
+rm $terraform_libvirt_provider_filename
+
+# install Packer.
+apt-get install -y unzip
+packer_version=1.5.5
+wget -q -O/tmp/packer_${packer_version}_linux_amd64.zip https://releases.hashicorp.com/packer/${packer_version}/packer_${packer_version}_linux_amd64.zip
+unzip /tmp/packer_${packer_version}_linux_amd64.zip -d /usr/local/bin
+# install useful packer plugins.
+wget -q -O/tmp/packer-provisioner-windows-update-linux.tgz https://github.com/rgl/packer-provisioner-windows-update/releases/download/v0.9.0/packer-provisioner-windows-update-linux.tgz
+tar xf /tmp/packer-provisioner-windows-update-linux.tgz -C /usr/local/bin
+chmod +x /usr/local/bin/packer-provisioner-windows-update
+rm /tmp/packer-provisioner-windows-update-linux.tgz
+
+# install Vagrant.
+vagrant_version=2.2.7
+wget -q -O/tmp/vagrant_${vagrant_version}_x86_64.deb https://releases.hashicorp.com/vagrant/${vagrant_version}/vagrant_${vagrant_version}_x86_64.deb
+dpkg -i /tmp/vagrant_${vagrant_version}_x86_64.deb
+rm /tmp/vagrant_${vagrant_version}_x86_64.deb
+# install useful vagrant plugins.
+apt-get install -y libvirt-dev gcc make
+su vagrant -c bash <<'VAGRANT_EOF'
+#!/bin/bash
+set -eux
+cd ~
+vagrant plugin install vagrant-reload
+CONFIGURE_ARGS='with-libvirt-include=/usr/include/libvirt with-libvirt-lib=/usr/lib' \
+    vagrant plugin install vagrant-libvirt
+vagrant plugin install vagrant-windows-update
+VAGRANT_EOF
+# add support for smb shared folders.
+# see https://github.com/hashicorp/vagrant/pull/9948
+pushd /opt/vagrant/embedded/gems/$vagrant_version/gems/vagrant-$vagrant_version
+wget -q https://github.com/hashicorp/vagrant/commit/ed7139fa1e896d0b84ed32180b72a647bf9f37eb.patch
+patch -p1 <ed7139fa1e896d0b84ed32180b72a647bf9f37eb.patch
+rm ed7139fa1e896d0b84ed32180b72a647bf9f37eb.patch
+popd
+apt-get install -y samba smbclient
+smbpasswd -a -s vagrant <<'EOF'
+vagrant
+vagrant
+EOF
+
+cd
+CONFIGURE_ARGS='with-libvirt-include=/usr/include/libvirt with-libvirt-lib=/usr/lib' \
+    vagrant plugin install vagrant-libvirt
+vagrant plugin install vagrant-windows-update
+vagrant plugin install vagrant-windows-sysprep
+vagrant plugin install vagrant-reload
+
+mkdir -p /data/images
+cd /var/lib/libvirt
+rm -rf images
+ln -s /data/images images
+
+# install the nfs server.
+sudo apt-get install -y nfs-kernel-server
+
+# enable password-less configuration of the nfs server exports.
+sudo bash -c 'cat >/etc/sudoers.d/vagrant-synced-folders' <<'EOF'
+Cmnd_Alias VAGRANT_EXPORTS_CHOWN = /bin/chown 0\:0 /tmp/*
+Cmnd_Alias VAGRANT_EXPORTS_MV = /bin/mv -f /tmp/* /etc/exports
+Cmnd_Alias VAGRANT_NFSD_CHECK = /etc/init.d/nfs-kernel-server status
+Cmnd_Alias VAGRANT_NFSD_START = /etc/init.d/nfs-kernel-server start
+Cmnd_Alias VAGRANT_NFSD_APPLY = /usr/sbin/exportfs -ar
+%sudo ALL=(root) NOPASSWD: VAGRANT_EXPORTS_CHOWN, VAGRANT_EXPORTS_MV, VAGRANT_NFSD_CHECK, VAGRANT_NFSD_START, VAGRANT_NFSD_APPLY
+EOF
+
+usermod -a -G kvm,libvirt,libvirt-qemu,libvirt-dnsmasq,sambashare vagrant
+chown -R vagrant:vagrant /data
+
+apt install -y software-properties-common
+apt-add-repository --yes --update ppa:ansible/ansible
+apt install -y ansible
+
+#reboot
